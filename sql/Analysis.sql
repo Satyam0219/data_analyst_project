@@ -19,7 +19,7 @@ SELECT
 FROM sales_cleaned;
 
 SELECT 
-    AVG(price) AS avg_price 
+ round(sum(sales)/count(distinct order_number)) AS avg_order_value
 FROM sales_cleaned;
 
 SELECT 
