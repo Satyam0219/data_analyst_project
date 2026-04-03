@@ -1,0 +1,231 @@
+-- ============================================
+-- STEP 0: Create Database
+-- ============================================
+
+-- Create the target database if it doesn't already exist
+CREATE DATABASE IF NOT EXISTS sales_db;
+-- Set the context to the newly created database
+USE sales_db;
+
+-- ============================================
+-- STEP 1: Raw Data Ingestion (Staging Layer)
+-- ============================================
+
+-- Ensure a clean slate by dropping the table if it exists
+DROP TABLE IF EXISTS customers_raw;
+
+-- Create the raw staging table with all columns as TEXT to prevent load errors
+CREATE TABLE customers_raw (
+    customer_id TEXT,
+    customer_key TEXT,
+    first_name TEXT,
+    last_name TEXT,
+    marital_status TEXT,
+    gender TEXT,
+    create_date TEXT
+);
+
+-- Load data from the local CSV file into the raw table
+LOAD DATA LOCAL INFILE '/Users/mac/Downloads/customers.csv'
+INTO TABLE customers_raw
+CHARACTER SET utf8mb4
+FIELDS TERMINATED BY ',' 
+OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 LINES; -- Skip the header row
+
+-- ============================================
+-- STEP 2: Data Cleaning + Type Conversion
+-- ============================================
+
+DROP TABLE IF EXISTS customers_staging;
+
+-- Create a staging table to apply structural cleaning and type casting
+CREATE TABLE customers_staging AS
+SELECT 
+    -- Validate that customer_id contains only digits, then cast to an integer (SIGNED)
+    CASE 
+        WHEN customer_id REGEXP '^[0-9]+$' THEN CAST(customer_id AS SIGNED)
+        ELSE NULL
+    END AS customer_id,
+
+    customer_key,
+
+    -- Remove leading/trailing spaces; convert empty strings to NULL
+    NULLIF(TRIM(first_name), '') AS first_name,
+    NULLIF(TRIM(last_name), '') AS last_name,
+
+    -- Standardize marital status codes to full text
+    CASE 
+        WHEN marital_status = 'M' THEN 'MARRIED'
+        WHEN marital_status = 'S' THEN 'SINGLE'
+        ELSE 'N/A'
+    END AS marital_status,
+
+    -- Standardize gender values, handling mixed cases and abbreviations
+    CASE 
+        WHEN UPPER(TRIM(gender)) IN ('M','MALE') THEN 'MALE'
+        WHEN UPPER(TRIM(gender)) IN ('F','FEMALE') THEN 'FEMALE'
+        ELSE 'N/A'
+    END AS gender,
+
+    -- Validate date format (YYYY-MM-DD) before parsing to an actual DATE type
+    CASE 
+        WHEN create_date REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+        THEN STR_TO_DATE(create_date, '%Y-%m-%d')
+        ELSE NULL
+    END AS create_date
+FROM customers_raw;
+
+-- ============================================
+-- STEP 3: Deduplication (Latest Record Only)
+-- ============================================
+
+DROP TABLE IF EXISTS customers_cleaned;
+
+-- Create the final cleaned table by removing duplicate records
+CREATE TABLE customers_cleaned AS
+SELECT 
+	customer_id,
+	customer_key,
+	first_name,
+	last_name,
+	marital_status,
+	gender, 
+	create_date
+FROM (
+    -- Use a Window Function to assign a row number to each record per customer
+    -- Ordering by create_date DESC ensures the most recent record gets rn = 1
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY customer_id
+            ORDER BY create_date DESC
+        ) AS rn
+    FROM customers_staging
+) t
+-- Filter to keep only the latest record (rn = 1) and drop invalid (NULL) IDs
+WHERE rn = 1 AND customer_id IS NOT NULL;
+
+-- ============================================
+-- STEP 4: Data Quality Checks
+-- ============================================
+
+-- Verify that no duplicate customer_ids remain
+SELECT customer_id, COUNT(*) 
+FROM customers_cleaned
+GROUP BY customer_id
+HAVING COUNT(*) > 1;
+
+-- Verify that no NULL customer_ids made it through
+SELECT COUNT(*) AS null_customer_ids
+FROM customers_cleaned
+WHERE customer_id IS NULL;
+
+-- Verify how many invalid/NULL dates exist in the cleaned dataset
+SELECT COUNT(*) AS null_dates
+FROM customers_cleaned
+WHERE create_date IS NULL;
+
+-- ============================================
+-- FINAL OUTPUT & SECONDARY DATA LOAD (`cust`)
+-- ============================================
+
+SELECT * FROM customers_cleaned;
+drop table cust;
+-- Create secondary customer table for additional data source
+CREATE TABLE cust (
+    cid TEXT, 
+    bdate TEXT,
+    gen TEXT
+);
+
+-- Load the secondary customer data
+LOAD DATA LOCAL INFILE '/Users/mac/Downloads/cust.csv'
+INTO TABLE cust
+CHARACTER SET utf8mb4
+FIELDS TERMINATED BY ',' 
+OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 LINES;
+
+-- Profiling checks on the cust table
+SELECT 
+    -- Total rows in the table
+    COUNT(*) AS total_rows,
+
+    -- Checks for the 'cid' (Customer ID) column
+    COUNT(cid) AS non_null_cid,
+    COUNT(*) - COUNT(cid) AS null_cid,
+    COUNT(DISTINCT cid) AS unique_cids,
+    COUNT(*) - COUNT(DISTINCT cid) AS duplicate_cids,
+    SUM(CASE WHEN cid REGEXP '^[0-9]+$' THEN 1 ELSE 0 END) AS valid_cid,
+    SUM(CASE WHEN cid NOT REGEXP '^[0-9]+$' OR cid IS NULL THEN 1 ELSE 0 END) AS invalid_cid,
+
+    -- Checks for the 'bdate' (Birth Date) column
+    COUNT(bdate) AS non_null_bdate,
+    COUNT(*) - COUNT(bdate) AS null_bdate,
+    SUM(CASE WHEN bdate REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN 1 ELSE 0 END) AS valid_bdate_format,
+    SUM(CASE WHEN bdate NOT REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' OR bdate IS NULL THEN 1 ELSE 0 END) AS invalid_bdate_format,
+    MIN(bdate) AS min_bdate,
+    MAX(bdate) AS max_bdate,
+
+    -- Checks for the 'gen' (Gender) column
+    COUNT(gen) AS non_null_gen,
+    COUNT(*) - COUNT(gen) AS null_gen,
+    SUM(CASE WHEN UPPER(TRIM(gen)) IN ('M','MALE','F','FEMALE') THEN 1 ELSE 0 END) AS valid_gen,
+    SUM(CASE WHEN UPPER(TRIM(gen)) NOT IN ('M','MALE','F','FEMALE') OR gen IS NULL THEN 1 ELSE 0 END) AS invalid_gen
+FROM cust;
+
+-- Clean the secondary customer table
+CREATE TABLE cust_cleaned AS
+SELECT 
+    -- Remove the 'NAS' prefix from Customer IDs if it exists
+    CASE 
+        WHEN cid LIKE 'NAS%' THEN substring(cid, 4, LENGTH(cid)) 
+        ELSE cid 
+    END AS customer_id,
+    -- Cast string dates to DATE format
+    CAST(bdate AS date) AS birth_date,
+    -- Standardize gender values
+    CASE 
+        WHEN UPPER(TRIM(gen)) IN('M','MALE') THEN 'MALE' 
+        WHEN UPPER(TRIM(gen)) IN ('F','FEMALE') THEN 'FEMALE'
+        ELSE 'n/a'
+    END AS gender
+FROM cust;
+
+-- Clean the location data (Assumes `location_raw` exists in the DB)
+CREATE TABLE cleaned_location AS
+SELECT 
+    -- Remove hyphens from customer ID
+    REPLACE(cid, '-', '') AS customer_id,
+    -- Standardize country names
+    CASE 
+        WHEN UPPER(TRIM(cntry)) IN('US','UNITED STATES','USA') THEN 'United States' 
+        WHEN UPPER(TRIM(cntry)) IN('DE','GERMANY') THEN 'Germany' 
+        ELSE cntry  
+    END AS country
+FROM location_raw;
+
+-- Create the master customer table by joining all cleaned sources
+CREATE TABLE cleaned_customer AS 
+SELECT 
+    cc.customer_id, 
+    cc.customer_key, 
+    cc.first_name, 
+    cc.last_name, 
+    cc.marital_status, 
+    cc.create_date, 
+    c.birth_date, 
+    -- Merge gender data, prioritizing data from customers_cleaned, using cust_cleaned as a fallback
+    CASE 
+        WHEN cc.gender = 'N/A' THEN c.gender
+        WHEN c.gender = 'N/A' THEN cc.gender
+        ELSE cc.gender
+    END AS gender,
+    cl.country
+FROM customers_cleaned cc 
+LEFT JOIN cust_cleaned c ON cc.customer_key = c.customer_id 
+LEFT JOIN cleaned_location cl ON cc.customer_key = cl.customer_id; 
+
+SELECT count(*) FROM cleaned_customer;
